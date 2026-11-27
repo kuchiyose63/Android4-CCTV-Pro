@@ -5,8 +5,15 @@ import android.graphics.ImageFormat;
 import android.graphics.Rect;
 import android.graphics.YuvImage;
 import android.hardware.Camera;
+import android.media.MediaCodec;
+import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
+import android.media.MediaFormat;
+import android.media.MediaMuxer;
 import android.net.wifi.WifiManager;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.PowerManager;
 import android.os.StatFs;
 import android.text.format.Formatter;
@@ -27,11 +34,16 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.RandomAccessFile;
+import java.net.Inet4Address;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.ByteBuffer;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
@@ -60,13 +72,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
 
     private int currentCameraId = Camera.CameraInfo.CAMERA_FACING_BACK;
     private boolean isFlashOn = false;
-    private int jpegQuality = 60;
-    private int previewWidth = 640;
-    private int previewHeight = 480;
+    private int jpegQuality = 75;
+    private int previewWidth = 1280;
+    private int previewHeight = 720;
 
     private volatile boolean isRecording = false;
     private volatile boolean autoReplaceEnabled = true;
-    private SimpleMjpegAviWriter aviWriter = null;
+    private VideoRecorder recorder = null;
     private long segmentStartTime = 0;
     private long lastRecordFrameTime = 0;
     private File recordDir;
@@ -85,10 +97,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         Button btnSwitchCam = findViewById(R.id.btnSwitchCam);
         Button btnDimScreen = findViewById(R.id.btnDimScreen);
 
-        File baseDir = getExternalFilesDir(null);
-        if (baseDir == null) baseDir = getFilesDir();
+        File baseDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES);
         recordDir = new File(baseDir, "CCTV_Records");
-        if (!recordDir.exists()) recordDir.mkdirs();
+        if (!recordDir.exists()) {
+            recordDir.mkdirs();
+        }
 
         SurfaceView surfaceView = findViewById(R.id.surfaceView);
         surfaceHolder = surfaceView.getHolder();
@@ -121,12 +134,31 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
     }
 
     private void updateIpDisplay() {
+        String ip = "0.0.0.0";
         WifiManager wm = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
         if (wm != null) {
             int ipInt = wm.getConnectionInfo().getIpAddress();
-            String ip = Formatter.formatIpAddress(ipInt);
-            tvIpAddress.setText("Buka di Browser: http://" + ip + ":" + PORT);
+            if (ipInt != 0) {
+                ip = Formatter.formatIpAddress(ipInt);
+            }
         }
+        if ("0.0.0.0".equals(ip)) {
+            try {
+                List<NetworkInterface> interfaces = Collections.list(NetworkInterface.getNetworkInterfaces());
+                for (NetworkInterface intf : interfaces) {
+                    List<InetAddress> addrs = Collections.list(intf.getInetAddresses());
+                    for (InetAddress addr : addrs) {
+                        if (!addr.isLoopbackAddress() && addr instanceof Inet4Address) {
+                            ip = addr.getHostAddress();
+                            break;
+                        }
+                    }
+                    if (!"0.0.0.0".equals(ip)) break;
+                }
+            } catch (Exception ignored) {}
+        }
+        final String finalIp = ip;
+        runOnUiThread(() -> tvIpAddress.setText("Buka di Browser: http://" + finalIp + ":" + PORT));
     }
 
     private void updateStatusText() {
@@ -134,8 +166,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             String camLabel = (currentCameraId == Camera.CameraInfo.CAMERA_FACING_FRONT) ? "Depan" : "Belakang";
             String recLabel = isRecording ? "[REC AKTIF]" : "[Standby]";
             String autoLabel = autoReplaceEnabled ? "ON" : "OFF";
+            String fmtLabel = (Build.VERSION.SDK_INT >= 18) ? "MP4" : "AVI";
             long freeMb = getFreeSpaceMB();
-            tvStatus.setText(recLabel + " | Cam: " + camLabel + " | Auto-Replace: " + autoLabel + " | Sisa Memori: " + freeMb + " MB");
+            tvStatus.setText(recLabel + " | " + previewWidth + "x" + previewHeight + " (" + fmtLabel + ") | Cam: " + camLabel + " | Auto-Replace: " + autoLabel + " | Sisa: " + freeMb + " MB");
             btnRecord.setText(isRecording ? "Stop Rekam" : "Mulai Rekam");
         });
     }
@@ -153,14 +186,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             camera = Camera.open(currentCameraId);
             Camera.Parameters params = camera.getParameters();
 
+            // Pilih resolusi HD 1280x720 (720p) atau resolusi tertinggi di bawah 1280x720
             List<Camera.Size> sizes = params.getSupportedPreviewSizes();
+            Camera.Size bestSize = null;
             for (Camera.Size size : sizes) {
-                if (size.width <= 640 && size.height <= 480) {
-                    previewWidth = size.width;
-                    previewHeight = size.height;
+                if (size.width == 1280 && size.height == 720) {
+                    bestSize = size;
                     break;
                 }
+                if (size.width <= 1280 && size.height <= 720) {
+                    if (bestSize == null || (size.width * size.height > bestSize.width * bestSize.height)) {
+                        bestSize = size;
+                    }
+                }
             }
+            if (bestSize == null && !sizes.isEmpty()) {
+                bestSize = sizes.get(sizes.size() - 1);
+            }
+            if (bestSize != null) {
+                previewWidth = bestSize.width;
+                previewHeight = bestSize.height;
+            }
+
             params.setPreviewSize(previewWidth, previewHeight);
             params.setPreviewFormat(ImageFormat.NV21);
 
@@ -173,6 +220,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             camera.setPreviewDisplay(surfaceHolder);
             camera.setPreviewCallback(this);
             camera.startPreview();
+            updateIpDisplay();
             updateStatusText();
         } catch (Exception e) {
             runOnUiThread(() -> tvStatus.setText("Gagal membuka kamera: " + e.getMessage()));
@@ -223,8 +271,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             }
             try {
                 String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
-                File videoFile = new File(recordDir, "REC_" + timeStamp + ".avi");
-                aviWriter = new SimpleMjpegAviWriter(videoFile, previewWidth, previewHeight, 10);
+                if (Build.VERSION.SDK_INT >= 18) {
+                    try {
+                        File mp4File = new File(recordDir, "REC_" + timeStamp + ".mp4");
+                        recorder = new Mp4AvcRecorder(mp4File, previewWidth, previewHeight, 15);
+                    } catch (Exception e) {
+                        // Fallback ke AVI jika chip perangkat jadul gagal inisialisasi H.264 encoder
+                        File aviFile = new File(recordDir, "REC_" + timeStamp + ".avi");
+                        recorder = new SimpleMjpegAviWriter(aviFile, previewWidth, previewHeight, 10);
+                    }
+                } else {
+                    File aviFile = new File(recordDir, "REC_" + timeStamp + ".avi");
+                    recorder = new SimpleMjpegAviWriter(aviFile, previewWidth, previewHeight, 10);
+                }
                 segmentStartTime = System.currentTimeMillis();
                 isRecording = true;
                 updateStatusText();
@@ -238,11 +297,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
     private void stopRecording() {
         synchronized (recordLock) {
             isRecording = false;
-            if (aviWriter != null) {
+            if (recorder != null) {
                 try {
-                    aviWriter.close();
+                    recorder.close();
                 } catch (Exception ignored) {}
-                aviWriter = null;
+                recorder = null;
             }
             updateStatusText();
         }
@@ -273,7 +332,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         });
 
         for (File f : files) {
-            if (f.isFile() && f.getName().endsWith(".avi")) {
+            if (f.isFile() && (f.getName().endsWith(".mp4") || f.getName().endsWith(".avi"))) {
                 f.delete();
                 if (getFreeSpaceMB() >= MIN_FREE_SPACE_MB) {
                     return true;
@@ -301,22 +360,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
     public void onPreviewFrame(byte[] data, Camera cam) {
         if (data == null) return;
         try {
-            YuvImage yuv = new YuvImage(data, ImageFormat.NV21, previewWidth, previewHeight, null);
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            yuv.compressToJpeg(new Rect(0, 0, previewWidth, previewHeight), jpegQuality, out);
-            byte[] jpegBytes = out.toByteArray();
-
-            synchronized (frameLock) {
-                latestJpegFrame = jpegBytes;
-            }
-
+            // Rekam frame video (MP4 H.264 atau AVI)
             if (isRecording) {
                 long now = System.currentTimeMillis();
-                if (now - lastRecordFrameTime >= 100) {
+                long minInterval = (Build.VERSION.SDK_INT >= 18) ? 65 : 100; // ~15 FPS untuk MP4
+                if (now - lastRecordFrameTime >= minInterval) {
                     lastRecordFrameTime = now;
                     synchronized (recordLock) {
-                        if (isRecording && aviWriter != null) {
-                            aviWriter.addFrame(jpegBytes);
+                        if (isRecording && recorder != null) {
+                            recorder.addYuvFrame(data, jpegQuality);
                             if (now - segmentStartTime >= SEGMENT_DURATION_MS) {
                                 stopRecording();
                                 startRecording();
@@ -324,6 +376,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
                         }
                     }
                 }
+            }
+
+            // Kompres ke JPEG untuk Live Stream Web
+            YuvImage yuv = new YuvImage(data, ImageFormat.NV21, previewWidth, previewHeight, null);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            yuv.compressToJpeg(new Rect(0, 0, previewWidth, previewHeight), jpegQuality, out);
+            byte[] jpegBytes = out.toByteArray();
+
+            synchronized (frameLock) {
+                latestJpegFrame = jpegBytes;
             }
         } catch (Exception ignored) {}
     }
@@ -378,7 +440,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
                         out.write("\r\n".getBytes());
                         out.flush();
                     }
-                    Thread.sleep(100);
+                    Thread.sleep(90);
                 }
             } else if (path.startsWith("/shot.jpg")) {
                 byte[] frame;
@@ -388,7 +450,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
                 if (frame != null) {
                     String header = "HTTP/1.1 200 OK\r\n" +
                             "Content-Type: image/jpeg\r\n" +
-                            "Content-Disposition: attachment; filename=\"snapshot.jpg\"\r\n" +
+                            "Content-Disposition: attachment; filename=\"snapshot_HD.jpg\"\r\n" +
                             "Content-Length: " + frame.length + "\r\n\r\n";
                     out.write(header.getBytes());
                     out.write(frame);
@@ -398,8 +460,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
                 String fileName = path.substring("/download?file=".length()).replaceAll("[^a-zA-Z0-9_.-]", "");
                 File target = new File(recordDir, fileName);
                 if (target.exists() && target.isFile()) {
+                    String mime = fileName.endsWith(".mp4") ? "video/mp4" : "video/x-msvideo";
                     String header = "HTTP/1.1 200 OK\r\n" +
-                            "Content-Type: video/x-msvideo\r\n" +
+                            "Content-Type: " + mime + "\r\n" +
                             "Content-Disposition: attachment; filename=\"" + target.getName() + "\"\r\n" +
                             "Content-Length: " + target.length() + "\r\n\r\n";
                     out.write(header.getBytes());
@@ -419,7 +482,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
                     runOnUiThread(this::switchCamera);
                 } else if (path.contains("cmd=rec")) {
                     runOnUiThread(this::toggleRecording);
-                    Thread.sleep(200);
+                    Thread.sleep(250);
                 } else if (path.contains("cmd=autoreplace")) {
                     autoReplaceEnabled = !autoReplaceEnabled;
                     updateStatusText();
@@ -433,11 +496,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
                     if (wasRec) startRecording();
                     updateStatusText();
                 } else if (path.contains("q=low")) {
-                    jpegQuality = 35;
+                    jpegQuality = 40;
                 } else if (path.contains("q=med")) {
-                    jpegQuality = 60;
+                    jpegQuality = 70;
                 } else if (path.contains("q=high")) {
-                    jpegQuality = 85;
+                    jpegQuality = 90;
                 }
 
                 String html = buildDashboardHtml();
@@ -466,7 +529,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         if (files != null && files.length > 0) {
             Arrays.sort(files, (f1, f2) -> Long.compare(f2.lastModified(), f1.lastModified()));
             for (File f : files) {
-                if (f.isFile() && f.getName().endsWith(".avi")) {
+                if (f.isFile() && (f.getName().endsWith(".mp4") || f.getName().endsWith(".avi"))) {
                     long sizeKb = f.length() / 1024;
                     fileListHtml.append("<div class='file-item'>")
                             .append("<span>").append(f.getName()).append(" (").append(sizeKb).append(" KB)</span>")
@@ -480,18 +543,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
 
         return "<!DOCTYPE html><html><head>" +
                 "<meta name='viewport' content='width=device-width, initial-scale=1.0'>" +
-                "<title>DIY CCTV Monitor</title>" +
+                "<title>DIY CCTV HD Monitor</title>" +
                 "<style>" +
                 "body{background:#121212;color:#fff;font-family:sans-serif;text-align:center;margin:0;padding:12px;}" +
-                "img{width:100%;max-width:720px;border:2px solid #333;border-radius:8px;background:#000;}" +
+                "img{width:100%;max-width:850px;border:2px solid #333;border-radius:8px;background:#000;}" +
                 ".controls{margin-top:10px;display:flex;flex-wrap:wrap;justify-content:center;gap:8px;}" +
                 "a.btn{color:#fff;text-decoration:none;padding:10px 14px;border-radius:6px;font-size:13px;font-weight:bold;}" +
                 ".btn-blue{background:#1e88e5;} .btn-warn{background:#f57c00;} .btn-green{background:#2e7d32;} .btn-red{background:#c62828;} .btn-gray{background:#424242;}" +
-                ".box{max-width:720px;margin:16px auto;background:#1e1e1e;padding:12px;border-radius:8px;text-align:left;}" +
+                ".box{max-width:850px;margin:16px auto;background:#1e1e1e;padding:12px;border-radius:8px;text-align:left;}" +
                 ".file-item{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #333;font-size:13px;}" +
                 ".dl-btn{background:#2e7d32;color:#fff;padding:5px 10px;border-radius:4px;text-decoration:none;font-weight:bold;}" +
                 "</style></head><body>" +
-                "<h3>Live CCTV Android 4</h3>" +
+                "<h3>Live CCTV HD (" + previewWidth + "x" + previewHeight + ")</h3>" +
                 "<img src='/stream' alt='Live Stream'/>" +
                 "<div class='controls'>" +
                 "<a class='btn " + recBtnClass + "' href='/?cmd=rec'>" + recBtnText + "</a>" +
@@ -500,16 +563,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
                 "<div class='controls'>" +
                 "<a class='btn btn-warn' href='/?cmd=flash'>Lampu Flash</a>" +
                 "<a class='btn btn-blue' href='/?cmd=switch'>Ganti Kamera</a>" +
-                "<a class='btn btn-gray' href='/shot.jpg' target='_blank'>Snapshot Foto</a>" +
+                "<a class='btn btn-gray' href='/shot.jpg' target='_blank'>Snapshot HD</a>" +
                 "</div>" +
                 "<div class='controls'>" +
-                "<a class='btn btn-gray' href='/?q=low'>Kualitas Rendah</a>" +
-                "<a class='btn btn-gray' href='/?q=med'>Sedang</a>" +
-                "<a class='btn btn-gray' href='/?q=high'>Tinggi</a>" +
+                "<a class='btn btn-gray' href='/?q=low'>Stream Hemat</a>" +
+                "<a class='btn btn-gray' href='/?q=med'>Stream Sedang</a>" +
+                "<a class='btn btn-gray' href='/?q=high'>Stream HD Tajam</a>" +
                 "</div>" +
                 "<div class='box'>" +
                 "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;'>" +
-                "<strong>Rekaman Tersimpan (Sisa Memori: " + getFreeSpaceMB() + " MB)</strong>" +
+                "<strong>Folder: Movies/CCTV_Records (Sisa: " + getFreeSpaceMB() + " MB)</strong>" +
                 "<a class='btn btn-red' style='padding:5px 10px;font-size:12px;' href='/?cmd=clearall'>Hapus Semua</a>" +
                 "</div>" +
                 fileListHtml.toString() +
@@ -541,7 +604,165 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
         super.onDestroy();
     }
 
-    private static class SimpleMjpegAviWriter {
+    // --- INTERFACE UMUM PEREKAM VIDEO ---
+    private interface VideoRecorder {
+        void addYuvFrame(byte[] nv21Data, int jpegQuality) throws Exception;
+        void close() throws Exception;
+    }
+
+    // --- PEREKAM MP4 (H.264 + MediaMuxer untuk Android 4.3+ / API 18+) ---
+    private static class Mp4AvcRecorder implements VideoRecorder {
+        private final MediaCodec encoder;
+        private final MediaMuxer muxer;
+        private final int width;
+        private final int height;
+        private final int colorFormat;
+        private final byte[] convertedBuffer;
+        private int trackIndex = -1;
+        private boolean muxerStarted = false;
+        private final long startTimeNanos;
+        private final MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
+
+        public Mp4AvcRecorder(File outputFile, int width, int height, int fps) throws Exception {
+            this.width = width;
+            this.height = height;
+            this.convertedBuffer = new byte[width * height * 3 / 2];
+            this.startTimeNanos = System.nanoTime();
+
+            MediaCodecInfo codecInfo = selectCodec("video/avc");
+            if (codecInfo == null) throw new IOException("No AVC codec");
+            this.colorFormat = selectColorFormat(codecInfo, "video/avc");
+
+            MediaFormat format = MediaFormat.createVideoFormat("video/avc", width, height);
+            format.setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat);
+            format.setInteger(MediaFormat.KEY_BIT_RATE, 2000000); // 2 Mbps HD
+            format.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
+            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2);
+
+            encoder = MediaCodec.createByCodecName(codecInfo.getName());
+            encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            encoder.start();
+
+            muxer = new MediaMuxer(outputFile.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+        }
+
+        private static MediaCodecInfo selectCodec(String mimeType) {
+            int numCodecs = MediaCodecList.getCodecCount();
+            for (int i = 0; i < numCodecs; i++) {
+                MediaCodecInfo codecInfo = MediaCodecList.getCodecInfoAt(i);
+                if (!codecInfo.isEncoder()) continue;
+                for (String type : codecInfo.getSupportedTypes()) {
+                    if (type.equalsIgnoreCase(mimeType)) return codecInfo;
+                }
+            }
+            return null;
+        }
+
+        private static int selectColorFormat(MediaCodecInfo codecInfo, String mimeType) {
+            MediaCodecInfo.CodecCapabilities caps = codecInfo.getCapabilitiesForType(mimeType);
+            for (int format : caps.colorFormats) {
+                if (format == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar ||
+                    format == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar) {
+                    return format;
+                }
+            }
+            return MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar;
+        }
+
+        private byte[] convertNv21(byte[] nv21) {
+            int frameSize = width * height;
+            System.arraycopy(nv21, 0, convertedBuffer, 0, frameSize);
+            if (colorFormat == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar) {
+                // NV21 (V,U) -> NV12 (U,V)
+                for (int i = frameSize; i < frameSize + frameSize / 2; i += 2) {
+                    convertedBuffer[i] = nv21[i + 1];
+                    convertedBuffer[i + 1] = nv21[i];
+                }
+            } else {
+                // NV21 -> I420 Planar
+                int uIndex = frameSize;
+                int vIndex = frameSize + frameSize / 4;
+                for (int i = frameSize; i < frameSize + frameSize / 2; i += 2) {
+                    convertedBuffer[vIndex++] = nv21[i];
+                    convertedBuffer[uIndex++] = nv21[i + 1];
+                }
+            }
+            return convertedBuffer;
+        }
+
+        @Override
+        public void addYuvFrame(byte[] nv21Data, int jpegQuality) {
+            ByteBuffer[] inputBuffers = encoder.getInputBuffers();
+            int inputBufferIndex = encoder.dequeueInputBuffer(5000);
+            if (inputBufferIndex >= 0) {
+                ByteBuffer inputBuffer = inputBuffers[inputBufferIndex];
+                inputBuffer.clear();
+                byte[] frameData = convertNv21(nv21Data);
+                int length = Math.min(inputBuffer.capacity(), frameData.length);
+                inputBuffer.put(frameData, 0, length);
+                long ptsUsec = (System.nanoTime() - startTimeNanos) / 1000L;
+                encoder.queueInputBuffer(inputBufferIndex, 0, length, ptsUsec, 0);
+            }
+            drainEncoder(false);
+        }
+
+        private void drainEncoder(boolean endOfStream) {
+            if (endOfStream) {
+                int inIdx = encoder.dequeueInputBuffer(5000);
+                if (inIdx >= 0) {
+                    encoder.queueInputBuffer(inIdx, 0, 0, (System.nanoTime() - startTimeNanos) / 1000L, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                }
+            }
+            ByteBuffer[] outputBuffers = encoder.getOutputBuffers();
+            while (true) {
+                int outIdx = encoder.dequeueOutputBuffer(bufferInfo, 5000);
+                if (outIdx == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                    if (!endOfStream) break;
+                } else if (outIdx == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) {
+                    outputBuffers = encoder.getOutputBuffers();
+                } else if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    if (!muxerStarted) {
+                        MediaFormat newFormat = encoder.getOutputFormat();
+                        trackIndex = muxer.addTrack(newFormat);
+                        muxer.start();
+                        muxerStarted = true;
+                    }
+                } else if (outIdx >= 0) {
+                    ByteBuffer encodedData = outputBuffers[outIdx];
+                    if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                        bufferInfo.size = 0;
+                    }
+                    if (bufferInfo.size != 0 && muxerStarted) {
+                        encodedData.position(bufferInfo.offset);
+                        encodedData.limit(bufferInfo.offset + bufferInfo.size);
+                        muxer.writeSampleData(trackIndex, encodedData, bufferInfo);
+                    }
+                    encoder.releaseOutputBuffer(outIdx, false);
+                    if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break;
+                }
+            }
+        }
+
+        @Override
+        public void close() {
+            try {
+                drainEncoder(true);
+            } catch (Exception ignored) {}
+            try {
+                encoder.stop();
+                encoder.release();
+            } catch (Exception ignored) {}
+            try {
+                if (muxerStarted) {
+                    muxer.stop();
+                }
+                muxer.release();
+            } catch (Exception ignored) {}
+        }
+    }
+
+    // --- PEREKAM CADANGAN AVI (Khusus Android 4.0 - 4.2 / API 14 - 17) ---
+    private static class SimpleMjpegAviWriter implements VideoRecorder {
         private final File file;
         private final BufferedOutputStream bos;
         private final int width;
@@ -557,15 +778,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             this.height = height;
             this.fps = fps;
             this.bos = new BufferedOutputStream(new FileOutputStream(file), 32768);
-            writeHeaderPlaceholder();
+            bos.write(new byte[224]);
         }
 
-        private void writeHeaderPlaceholder() throws IOException {
-            byte[] header = new byte[224];
-            bos.write(header);
-        }
+        @Override
+        public void addYuvFrame(byte[] nv21Data, int jpegQuality) throws IOException {
+            YuvImage yuv = new YuvImage(nv21Data, ImageFormat.NV21, width, height, null);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            yuv.compressToJpeg(new Rect(0, 0, width, height), jpegQuality, out);
+            byte[] jpegData = out.toByteArray();
 
-        public void addFrame(byte[] jpegData) throws IOException {
             int len = jpegData.length;
             int pad = (len % 2 != 0) ? 1 : 0;
             writeFourCC("00dc");
@@ -578,6 +800,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             moviDataSize += (8 + len + pad);
         }
 
+        @Override
         public void close() throws IOException {
             long idxSize = frameCount * 16L;
             writeFourCC("idx1");
@@ -601,11 +824,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             writeRafFourCC(raf, "RIFF");
             writeRafIntLE(raf, (int) totalRiffSize);
             writeRafFourCC(raf, "AVI ");
-
             writeRafFourCC(raf, "LIST");
             writeRafIntLE(raf, 192);
             writeRafFourCC(raf, "hdrl");
-
             writeRafFourCC(raf, "avih");
             writeRafIntLE(raf, 56);
             writeRafIntLE(raf, 1000000 / fps);
@@ -623,7 +844,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             writeRafFourCC(raf, "LIST");
             writeRafIntLE(raf, 116);
             writeRafFourCC(raf, "strl");
-
             writeRafFourCC(raf, "strh");
             writeRafIntLE(raf, 56);
             writeRafFourCC(raf, "vids");
@@ -660,31 +880,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Ca
             raf.close();
         }
 
-        private void writeFourCC(String s) throws IOException {
-            bos.write(s.getBytes("US-ASCII"));
-        }
-
+        private void writeFourCC(String s) throws IOException { bos.write(s.getBytes("US-ASCII")); }
         private void writeIntLE(int v) throws IOException {
-            bos.write(v & 0xFF);
-            bos.write((v >> 8) & 0xFF);
-            bos.write((v >> 16) & 0xFF);
-            bos.write((v >> 24) & 0xFF);
+            bos.write(v & 0xFF); bos.write((v >> 8) & 0xFF); bos.write((v >> 16) & 0xFF); bos.write((v >> 24) & 0xFF);
         }
-
-        private void writeRafFourCC(RandomAccessFile raf, String s) throws IOException {
-            raf.write(s.getBytes("US-ASCII"));
-        }
-
+        private void writeRafFourCC(RandomAccessFile raf, String s) throws IOException { raf.write(s.getBytes("US-ASCII")); }
         private void writeRafIntLE(RandomAccessFile raf, int v) throws IOException {
-            raf.write(v & 0xFF);
-            raf.write((v >> 8) & 0xFF);
-            raf.write((v >> 16) & 0xFF);
-            raf.write((v >> 24) & 0xFF);
+            raf.write(v & 0xFF); raf.write((v >> 8) & 0xFF); raf.write((v >> 16) & 0xFF); raf.write((v >> 24) & 0xFF);
         }
-
         private void writeRafShortLE(RandomAccessFile raf, short v) throws IOException {
-            raf.write(v & 0xFF);
-            raf.write((v >> 8) & 0xFF);
+            raf.write(v & 0xFF); raf.write((v >> 8) & 0xFF);
         }
     }
 }
