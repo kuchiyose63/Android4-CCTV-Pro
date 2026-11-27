@@ -25,6 +25,7 @@ import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -86,14 +87,14 @@ public class CctvService extends Service implements Camera.PreviewCallback {
     private long segmentStartTime = 0;
     private long lastRecordFrameTime = 0;
     private File recordDir;
+    private String storageLabel = "DCIM/CCTV_Records";
+    private String lastErrorMsg = "";
     private final Object recordLock = new Object();
 
     @Override
     public void onCreate() {
         super.onCreate();
-        File baseDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM);
-        recordDir = new File(baseDir, "CCTV_Records");
-        if (!recordDir.exists()) recordDir.mkdirs();
+        initWritableStorageDir();
 
         PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "DIYCCTV:BgCpuLock");
@@ -103,6 +104,45 @@ public class CctvService extends Service implements Camera.PreviewCallback {
         startForegroundNotification();
         startHttpServer();
         initCamera(currentCameraId);
+    }
+
+    private void initWritableStorageDir() {
+        // 1. Coba folder publik DCIM/CCTV_Records terlebih dahulu
+        File dcimDir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "CCTV_Records");
+        if (canWriteDirectory(dcimDir)) {
+            recordDir = dcimDir;
+            storageLabel = "DCIM/CCTV_Records";
+            return;
+        }
+
+        // 2. Fallback 1: Folder eksternal khusus aplikasi (Bebas blokir EACCES di Android 4.4 KitKat)
+        File extAppDir = getExternalFilesDir("CCTV_Records");
+        if (canWriteDirectory(extAppDir)) {
+            recordDir = extAppDir;
+            storageLabel = "Android/data/.../CCTV_Records";
+            return;
+        }
+
+        // 3. Fallback 2: Memori internal privat aplikasi (Pasti bisa ditulis di semua versi Android)
+        File intAppDir = new File(getFilesDir(), "CCTV_Records");
+        if (!intAppDir.exists()) intAppDir.mkdirs();
+        recordDir = intAppDir;
+        storageLabel = "InternalApp/CCTV_Records";
+    }
+
+    private boolean canWriteDirectory(File dir) {
+        if (dir == null) return false;
+        try {
+            if (!dir.exists() && !dir.mkdirs()) return false;
+            File testFile = new File(dir, ".write_test");
+            FileOutputStream fos = new FileOutputStream(testFile);
+            fos.write(1);
+            fos.close();
+            testFile.delete();
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     @Override
@@ -194,6 +234,9 @@ public class CctvService extends Service implements Camera.PreviewCallback {
         String autoLabel = autoReplaceEnabled ? "ON" : "OFF";
         String fmtLabel = (Build.VERSION.SDK_INT >= 18) ? "MP4" : "AVI";
         String status = recLabel + " | " + previewWidth + "x" + previewHeight + " (" + fmtLabel + ") | Cam: " + camLabel + " | Auto: " + autoLabel + " | Sisa: " + getFreeSpaceMB() + " MB";
+        if (!lastErrorMsg.isEmpty()) {
+            status = lastErrorMsg;
+        }
         if (statusListener != null) {
             statusListener.onStatusChanged("Buka di Browser: " + getIpUrl(), status, isRecording);
         }
@@ -279,8 +322,15 @@ public class CctvService extends Service implements Camera.PreviewCallback {
 
     public void startRecording() {
         synchronized (recordLock) {
-            if (isRecording || !ensureStorageSpace()) return;
+            if (isRecording) return;
+            initWritableStorageDir();
+            if (!ensureStorageSpace()) {
+                lastErrorMsg = "Gagal Rekam: Memori penuh & Auto-Replace mati!";
+                notifyStatus();
+                return;
+            }
             try {
+                lastErrorMsg = "";
                 String ts = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
                 if (Build.VERSION.SDK_INT >= 18) {
                     try {
@@ -296,6 +346,8 @@ public class CctvService extends Service implements Camera.PreviewCallback {
                 notifyStatus();
             } catch (Exception e) {
                 isRecording = false;
+                lastErrorMsg = "Error rekam: " + e.getMessage();
+                notifyStatus();
             }
         }
     }
@@ -480,7 +532,7 @@ public class CctvService extends Service implements Camera.PreviewCallback {
                 "<div class='controls'><a class='btn " + recBtnClass + "' href='/?cmd=rec'>" + recBtnText + "</a><a class='btn " + autoClass + "' href='/?cmd=autoreplace'>" + autoText + "</a></div>" +
                 "<div class='controls'><a class='btn btn-warn' href='/?cmd=flash'>Lampu Flash</a><a class='btn btn-blue' href='/?cmd=switch'>Ganti Kamera</a><a class='btn btn-gray' href='/shot.jpg' target='_blank'>Snapshot HD</a></div>" +
                 "<div class='controls'><a class='btn btn-gray' href='/?q=low'>Stream Hemat</a><a class='btn btn-gray' href='/?q=med'>Stream Sedang</a><a class='btn btn-gray' href='/?q=high'>Stream HD Tajam</a></div>" +
-                "<div class='box'><div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;'><strong>Folder: DCIM/CCTV_Records (Sisa: " + getFreeSpaceMB() + " MB)</strong><a class='btn btn-red' style='padding:5px 10px;font-size:12px;' href='/?cmd=clearall'>Hapus Semua</a></div>" +
+                "<div class='box'><div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;'><strong>Folder: " + storageLabel + " (Sisa: " + getFreeSpaceMB() + " MB)</strong><a class='btn btn-red' style='padding:5px 10px;font-size:12px;' href='/?cmd=clearall'>Hapus Semua</a></div>" +
                 fileListHtml.toString() + "</div></body></html>";
     }
 
