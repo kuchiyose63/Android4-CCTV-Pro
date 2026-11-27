@@ -24,23 +24,22 @@ jobs:
         with:
           gradle-version: '7.6.4'
 
-      - name: Cari Folder Proyek & Kompilasi APK
+      - name: Bersihkan Nama File & Kompilasi APK
         run: |
-          echo "=== Daftar Seluruh File di Repo ==="
-          find . -maxdepth 4 -not -path '*/.*'
+          # Hapus karakter spasi atau baris baru (Enter) tersembunyi di ujung semua nama file
+          python3 -c '
+          import os
+          for root, dirs, files in os.walk("."):
+              if ".git" in root: continue
+              for f in files:
+                  clean = f.strip()
+                  if f != clean:
+                      os.rename(os.path.join(root, f), os.path.join(root, clean))
+                      print("Fixed filename:", repr(f), "->", repr(clean))
+          '
           
-          # Hapus spasi tidak sengaja pada nama file build.gradle jika ada
-          find . -name "build.gradle*" -exec bash -c 'mv "$0" "${0%"${0##*[![:space:]]}"}" 2>/dev/null || true' {} \;
-          
-          # Cari lokasi build.gradle dan pindah ke direktorinya
           GRADLE_FILE=$(find . -name "build.gradle" | head -n 1)
-          if [ -z "$GRADLE_FILE" ]; then
-            echo "ERROR: File build.gradle sama sekali tidak ditemukan!"
-            exit 1
-          fi
-          
           PROJECT_DIR=$(dirname "$GRADLE_FILE")
-          echo "Menjalankan build di folder: $PROJECT_DIR"
           cd "$PROJECT_DIR"
           gradle assembleDebug
 
