@@ -77,9 +77,10 @@ public class CctvService extends Service implements Camera.PreviewCallback {
 
     private int currentCameraId = Camera.CameraInfo.CAMERA_FACING_BACK;
     private boolean isFlashOn = false;
-    private int jpegQuality = 75;
+    private int jpegQuality = 85;
     private int previewWidth = 1280;
     private int previewHeight = 720;
+    private boolean wideMode = true; // true = full sensor (tidak zoom/crop), false = 16:9 HD
 
     private volatile boolean isRecording = false;
     private volatile boolean autoReplaceEnabled = true;
@@ -107,23 +108,18 @@ public class CctvService extends Service implements Camera.PreviewCallback {
     }
 
     private void initWritableStorageDir() {
-        // 1. Coba folder publik DCIM/CCTV_Records terlebih dahulu
         File dcimDir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "CCTV_Records");
         if (canWriteDirectory(dcimDir)) {
             recordDir = dcimDir;
             storageLabel = "DCIM/CCTV_Records";
             return;
         }
-
-        // 2. Fallback 1: Folder eksternal khusus aplikasi (Bebas blokir EACCES di Android 4.4 KitKat)
         File extAppDir = getExternalFilesDir("CCTV_Records");
         if (canWriteDirectory(extAppDir)) {
             recordDir = extAppDir;
             storageLabel = "Android/data/.../CCTV_Records";
             return;
         }
-
-        // 3. Fallback 2: Memori internal privat aplikasi (Pasti bisa ditulis di semua versi Android)
         File intAppDir = new File(getFilesDir(), "CCTV_Records");
         if (!intAppDir.exists()) intAppDir.mkdirs();
         recordDir = intAppDir;
@@ -231,9 +227,9 @@ public class CctvService extends Service implements Camera.PreviewCallback {
     private void notifyStatus() {
         String camLabel = (currentCameraId == Camera.CameraInfo.CAMERA_FACING_FRONT) ? "Depan" : "Belakang";
         String recLabel = isRecording ? "[REC AKTIF]" : "[Standby BG]";
-        String autoLabel = autoReplaceEnabled ? "ON" : "OFF";
         String fmtLabel = (Build.VERSION.SDK_INT >= 18) ? "MP4" : "AVI";
-        String status = recLabel + " | " + previewWidth + "x" + previewHeight + " (" + fmtLabel + ") | Cam: " + camLabel + " | Auto: " + autoLabel + " | Sisa: " + getFreeSpaceMB() + " MB";
+        String viewLabel = wideMode ? "Wide" : "16:9";
+        String status = recLabel + " | " + previewWidth + "x" + previewHeight + " " + viewLabel + " (" + fmtLabel + ") | Cam: " + camLabel + " | Sisa: " + getFreeSpaceMB() + " MB";
         if (!lastErrorMsg.isEmpty()) {
             status = lastErrorMsg;
         }
@@ -252,27 +248,62 @@ public class CctvService extends Service implements Camera.PreviewCallback {
             camera = Camera.open(currentCameraId);
             Camera.Parameters params = camera.getParameters();
 
+            // 1. Paksa Zoom ke 0 (Sudut Pandang Terluas / Tidak Zoom)
+            if (params.isZoomSupported()) {
+                params.setZoom(0);
+            }
+
+            // 2. Pilih Resolusi HD Terbaik (Mode Wide menggunakan rasio sensor 4:3 agar tidak terpotong crop)
             List<Camera.Size> sizes = params.getSupportedPreviewSizes();
             Camera.Size bestSize = null;
             for (Camera.Size size : sizes) {
-                if (size.width == 1280 && size.height == 720) {
-                    bestSize = size;
-                    break;
-                }
-                if (size.width <= 1280 && size.height <= 720) {
+                if (size.width > 1280 || size.height > 960) continue;
+                if (wideMode) {
+                    // Prioritaskan 960x720 atau 800x600 (4:3 full sensor, sudut pandang paling lebar)
+                    if (bestSize == null || (size.width * size.height > bestSize.width * bestSize.height)) {
+                        bestSize = size;
+                    }
+                } else {
+                    // Prioritaskan 1280x720 (16:9 HD)
+                    if (size.width == 1280 && size.height == 720) {
+                        bestSize = size;
+                        break;
+                    }
                     if (bestSize == null || (size.width * size.height > bestSize.width * bestSize.height)) {
                         bestSize = size;
                     }
                 }
             }
-            if (bestSize == null && !sizes.isEmpty()) bestSize = sizes.get(sizes.size() - 1);
+            if (bestSize == null && !sizes.isEmpty()) bestSize = sizes.get(0);
             if (bestSize != null) {
                 previewWidth = bestSize.width;
                 previewHeight = bestSize.height;
             }
-
             params.setPreviewSize(previewWidth, previewHeight);
             params.setPreviewFormat(ImageFormat.NV21);
+
+            // 3. Naikkan FPS kamera ke rentang tertinggi yang didukung hardware
+            List<int[]> fpsRanges = params.getSupportedPreviewFpsRange();
+            if (fpsRanges != null && !fpsRanges.isEmpty()) {
+                int[] bestRange = fpsRanges.get(fpsRanges.size() - 1);
+                for (int[] range : fpsRanges) {
+                    if (range[1] >= bestRange[1] && range[0] >= bestRange[0]) {
+                        bestRange = range;
+                    }
+                }
+                params.setPreviewFpsRange(bestRange[0], bestRange[1]);
+            }
+
+            // 4. Aktifkan Continuous Auto-Focus agar gambar tetap jernih
+            List<String> focusModes = params.getSupportedFocusModes();
+            if (focusModes != null) {
+                if (focusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO)) {
+                    params.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO);
+                } else if (focusModes.contains(Camera.Parameters.FOCUS_MODE_AUTO)) {
+                    params.setFocusMode(Camera.Parameters.FOCUS_MODE_AUTO);
+                }
+            }
+
             if (isFlashOn && params.getSupportedFlashModes() != null &&
                 params.getSupportedFlashModes().contains(Camera.Parameters.FLASH_MODE_TORCH)) {
                 params.setFlashMode(Camera.Parameters.FLASH_MODE_TORCH);
@@ -300,6 +331,14 @@ public class CctvService extends Service implements Camera.PreviewCallback {
             initCamera(nextCam);
             if (wasRecording) startRecording();
         }
+    }
+
+    public void toggleWideMode() {
+        boolean wasRecording = isRecording;
+        if (wasRecording) stopRecording();
+        wideMode = !wideMode;
+        initCamera(currentCameraId);
+        if (wasRecording) startRecording();
     }
 
     public synchronized void toggleFlash() {
@@ -334,12 +373,12 @@ public class CctvService extends Service implements Camera.PreviewCallback {
                 String ts = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
                 if (Build.VERSION.SDK_INT >= 18) {
                     try {
-                        recorder = new VideoRecorder.Mp4AvcRecorder(new File(recordDir, "REC_" + ts + ".mp4"), previewWidth, previewHeight, 15);
+                        recorder = new VideoRecorder.Mp4AvcRecorder(new File(recordDir, "REC_" + ts + ".mp4"), previewWidth, previewHeight, 24);
                     } catch (Exception e) {
-                        recorder = new VideoRecorder.SimpleMjpegAviWriter(new File(recordDir, "REC_" + ts + ".avi"), previewWidth, previewHeight, 10);
+                        recorder = new VideoRecorder.SimpleMjpegAviWriter(new File(recordDir, "REC_" + ts + ".avi"), previewWidth, previewHeight, 15);
                     }
                 } else {
-                    recorder = new VideoRecorder.SimpleMjpegAviWriter(new File(recordDir, "REC_" + ts + ".avi"), previewWidth, previewHeight, 10);
+                    recorder = new VideoRecorder.SimpleMjpegAviWriter(new File(recordDir, "REC_" + ts + ".avi"), previewWidth, previewHeight, 15);
                 }
                 segmentStartTime = System.currentTimeMillis();
                 isRecording = true;
@@ -393,7 +432,8 @@ public class CctvService extends Service implements Camera.PreviewCallback {
         try {
             if (isRecording) {
                 long now = System.currentTimeMillis();
-                long minInterval = (Build.VERSION.SDK_INT >= 18) ? 65 : 100;
+                // Jeda 35ms (~28 FPS maksimal) agar rekaman jauh lebih mulus
+                long minInterval = (Build.VERSION.SDK_INT >= 18) ? 35 : 65;
                 if (now - lastRecordFrameTime >= minInterval) {
                     lastRecordFrameTime = now;
                     synchronized (recordLock) {
@@ -450,7 +490,7 @@ public class CctvService extends Service implements Camera.PreviewCallback {
                         out.write("\r\n".getBytes());
                         out.flush();
                     }
-                    Thread.sleep(90);
+                    Thread.sleep(50); // ~20 FPS live stream
                 }
             } else if (path.startsWith("/shot.jpg")) {
                 byte[] frame;
@@ -476,6 +516,7 @@ public class CctvService extends Service implements Camera.PreviewCallback {
             } else {
                 if (path.contains("cmd=flash")) toggleFlash();
                 else if (path.contains("cmd=switch")) switchCamera();
+                else if (path.contains("cmd=wide")) toggleWideMode();
                 else if (path.contains("cmd=rec")) toggleRecording();
                 else if (path.contains("cmd=autoreplace")) { autoReplaceEnabled = !autoReplaceEnabled; notifyStatus(); }
                 else if (path.contains("cmd=clearall")) {
@@ -485,9 +526,9 @@ public class CctvService extends Service implements Camera.PreviewCallback {
                     if (files != null) for (File f : files) f.delete();
                     if (wasRec) startRecording();
                     notifyStatus();
-                } else if (path.contains("q=low")) jpegQuality = 40;
-                else if (path.contains("q=med")) jpegQuality = 70;
-                else if (path.contains("q=high")) jpegQuality = 90;
+                } else if (path.contains("q=low")) jpegQuality = 55;
+                else if (path.contains("q=med")) jpegQuality = 80;
+                else if (path.contains("q=high")) jpegQuality = 95;
 
                 byte[] htmlBytes = buildDashboardHtml().getBytes("UTF-8");
                 out.write(("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nContent-Length: " + htmlBytes.length + "\r\n\r\n").getBytes());
@@ -505,6 +546,7 @@ public class CctvService extends Service implements Camera.PreviewCallback {
         String recBtnClass = isRecording ? "btn-red" : "btn-green";
         String autoText = autoReplaceEnabled ? "Auto-Replace: ON" : "Auto-Replace: OFF";
         String autoClass = autoReplaceEnabled ? "btn-blue" : "btn-gray";
+        String wideText = wideMode ? "Sudut: Wide (Zoom Out)" : "Sudut: 16:9 HD";
 
         StringBuilder fileListHtml = new StringBuilder();
         File[] files = recordDir.listFiles();
@@ -528,9 +570,9 @@ public class CctvService extends Service implements Camera.PreviewCallback {
                 ".box{max-width:850px;margin:16px auto;background:#1e1e1e;padding:12px;border-radius:8px;text-align:left;}" +
                 ".file-item{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #333;font-size:13px;}" +
                 ".dl-btn{background:#2e7d32;color:#fff;padding:5px 10px;border-radius:4px;text-decoration:none;font-weight:bold;}" +
-                "</style></head><body><h3>Live CCTV Background (" + previewWidth + "x" + previewHeight + ")</h3><img src='/stream' alt='Live Stream'/>" +
+                "</style></head><body><h3>Live CCTV HD (" + previewWidth + "x" + previewHeight + ")</h3><img src='/stream' alt='Live Stream'/>" +
                 "<div class='controls'><a class='btn " + recBtnClass + "' href='/?cmd=rec'>" + recBtnText + "</a><a class='btn " + autoClass + "' href='/?cmd=autoreplace'>" + autoText + "</a></div>" +
-                "<div class='controls'><a class='btn btn-warn' href='/?cmd=flash'>Lampu Flash</a><a class='btn btn-blue' href='/?cmd=switch'>Ganti Kamera</a><a class='btn btn-gray' href='/shot.jpg' target='_blank'>Snapshot HD</a></div>" +
+                "<div class='controls'><a class='btn btn-blue' href='/?cmd=wide'>" + wideText + "</a><a class='btn btn-warn' href='/?cmd=flash'>Lampu Flash</a><a class='btn btn-blue' href='/?cmd=switch'>Ganti Kamera</a><a class='btn btn-gray' href='/shot.jpg' target='_blank'>Snapshot HD</a></div>" +
                 "<div class='controls'><a class='btn btn-gray' href='/?q=low'>Stream Hemat</a><a class='btn btn-gray' href='/?q=med'>Stream Sedang</a><a class='btn btn-gray' href='/?q=high'>Stream HD Tajam</a></div>" +
                 "<div class='box'><div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;'><strong>Folder: " + storageLabel + " (Sisa: " + getFreeSpaceMB() + " MB)</strong><a class='btn btn-red' style='padding:5px 10px;font-size:12px;' href='/?cmd=clearall'>Hapus Semua</a></div>" +
                 fileListHtml.toString() + "</div></body></html>";
