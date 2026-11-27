@@ -1,0 +1,295 @@
+package com.diy.cctv4;
+
+import android.graphics.ImageFormat;
+import android.graphics.Rect;
+import android.graphics.YuvImage;
+import android.media.MediaCodec;
+import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
+import android.media.MediaFormat;
+import android.media.MediaMuxer;
+
+import java.io.BufferedOutputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
+
+@SuppressWarnings("deprecation")
+public interface VideoRecorder {
+    void addYuvFrame(byte[] nv21Data, int jpegQuality) throws Exception;
+    void close() throws Exception;
+
+    class Mp4AvcRecorder implements VideoRecorder {
+        private final MediaCodec encoder;
+        private final MediaMuxer muxer;
+        private final int width;
+        private final int height;
+        private final int colorFormat;
+        private final byte[] convertedBuffer;
+        private int trackIndex = -1;
+        private boolean muxerStarted = false;
+        private final long startTimeNanos;
+        private final MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
+
+        public Mp4AvcRecorder(File outputFile, int width, int height, int fps) throws Exception {
+            this.width = width;
+            this.height = height;
+            this.convertedBuffer = new byte[width * height * 3 / 2];
+            this.startTimeNanos = System.nanoTime();
+
+            MediaCodecInfo codecInfo = selectCodec("video/avc");
+            if (codecInfo == null) throw new IOException("No AVC codec");
+            this.colorFormat = selectColorFormat(codecInfo, "video/avc");
+
+            MediaFormat format = MediaFormat.createVideoFormat("video/avc", width, height);
+            format.setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat);
+            format.setInteger(MediaFormat.KEY_BIT_RATE, 2000000);
+            format.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
+            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2);
+
+            encoder = MediaCodec.createByCodecName(codecInfo.getName());
+            encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            encoder.start();
+
+            muxer = new MediaMuxer(outputFile.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+        }
+
+        private static MediaCodecInfo selectCodec(String mimeType) {
+            int numCodecs = MediaCodecList.getCodecCount();
+            for (int i = 0; i < numCodecs; i++) {
+                MediaCodecInfo codecInfo = MediaCodecList.getCodecInfoAt(i);
+                if (!codecInfo.isEncoder()) continue;
+                for (String type : codecInfo.getSupportedTypes()) {
+                    if (type.equalsIgnoreCase(mimeType)) return codecInfo;
+                }
+            }
+            return null;
+        }
+
+        private static int selectColorFormat(MediaCodecInfo codecInfo, String mimeType) {
+            MediaCodecInfo.CodecCapabilities caps = codecInfo.getCapabilitiesForType(mimeType);
+            for (int format : caps.colorFormats) {
+                if (format == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar ||
+                    format == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar) {
+                    return format;
+                }
+            }
+            return MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar;
+        }
+
+        private byte[] convertNv21(byte[] nv21) {
+            int frameSize = width * height;
+            System.arraycopy(nv21, 0, convertedBuffer, 0, frameSize);
+            if (colorFormat == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar) {
+                for (int i = frameSize; i < frameSize + frameSize / 2; i += 2) {
+                    convertedBuffer[i] = nv21[i + 1];
+                    convertedBuffer[i + 1] = nv21[i];
+                }
+            } else {
+                int uIndex = frameSize;
+                int vIndex = frameSize + frameSize / 4;
+                for (int i = frameSize; i < frameSize + frameSize / 2; i += 2) {
+                    convertedBuffer[vIndex++] = nv21[i];
+                    convertedBuffer[uIndex++] = nv21[i + 1];
+                }
+            }
+            return convertedBuffer;
+        }
+
+        @Override
+        public void addYuvFrame(byte[] nv21Data, int jpegQuality) {
+            ByteBuffer[] inputBuffers = encoder.getInputBuffers();
+            int inputBufferIndex = encoder.dequeueInputBuffer(5000);
+            if (inputBufferIndex >= 0) {
+                ByteBuffer inputBuffer = inputBuffers[inputBufferIndex];
+                inputBuffer.clear();
+                byte[] frameData = convertNv21(nv21Data);
+                int length = Math.min(inputBuffer.capacity(), frameData.length);
+                inputBuffer.put(frameData, 0, length);
+                long ptsUsec = (System.nanoTime() - startTimeNanos) / 1000L;
+                encoder.queueInputBuffer(inputBufferIndex, 0, length, ptsUsec, 0);
+            }
+            drainEncoder(false);
+        }
+
+        private void drainEncoder(boolean endOfStream) {
+            if (endOfStream) {
+                int inIdx = encoder.dequeueInputBuffer(5000);
+                if (inIdx >= 0) {
+                    encoder.queueInputBuffer(inIdx, 0, 0, (System.nanoTime() - startTimeNanos) / 1000L, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                }
+            }
+            ByteBuffer[] outputBuffers = encoder.getOutputBuffers();
+            while (true) {
+                int outIdx = encoder.dequeueOutputBuffer(bufferInfo, 5000);
+                if (outIdx == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                    if (!endOfStream) break;
+                } else if (outIdx == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) {
+                    outputBuffers = encoder.getOutputBuffers();
+                } else if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    if (!muxerStarted) {
+                        MediaFormat newFormat = encoder.getOutputFormat();
+                        trackIndex = muxer.addTrack(newFormat);
+                        muxer.start();
+                        muxerStarted = true;
+                    }
+                } else if (outIdx >= 0) {
+                    ByteBuffer encodedData = outputBuffers[outIdx];
+                    if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                        bufferInfo.size = 0;
+                    }
+                    if (bufferInfo.size != 0 && muxerStarted) {
+                        encodedData.position(bufferInfo.offset);
+                        encodedData.limit(bufferInfo.offset + bufferInfo.size);
+                        muxer.writeSampleData(trackIndex, encodedData, bufferInfo);
+                    }
+                    encoder.releaseOutputBuffer(outIdx, false);
+                    if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break;
+                }
+            }
+        }
+
+        @Override
+        public void close() {
+            try { drainEncoder(true); } catch (Exception ignored) {}
+            try { encoder.stop(); encoder.release(); } catch (Exception ignored) {}
+            try { if (muxerStarted) muxer.stop(); muxer.release(); } catch (Exception ignored) {}
+        }
+    }
+
+    class SimpleMjpegAviWriter implements VideoRecorder {
+        private final File file;
+        private final BufferedOutputStream bos;
+        private final int width;
+        private final int height;
+        private final int fps;
+        private int frameCount = 0;
+        private long moviDataSize = 0;
+        private final List<Integer> frameSizes = new ArrayList<>();
+
+        public SimpleMjpegAviWriter(File file, int width, int height, int fps) throws IOException {
+            this.file = file;
+            this.width = width;
+            this.height = height;
+            this.fps = fps;
+            this.bos = new BufferedOutputStream(new FileOutputStream(file), 32768);
+            bos.write(new byte[224]);
+        }
+
+        @Override
+        public void addYuvFrame(byte[] nv21Data, int jpegQuality) throws IOException {
+            YuvImage yuv = new YuvImage(nv21Data, ImageFormat.NV21, width, height, null);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            yuv.compressToJpeg(new Rect(0, 0, width, height), jpegQuality, out);
+            byte[] jpegData = out.toByteArray();
+
+            int len = jpegData.length;
+            int pad = (len % 2 != 0) ? 1 : 0;
+            writeFourCC("00dc");
+            writeIntLE(len);
+            bos.write(jpegData);
+            if (pad > 0) bos.write(0);
+
+            frameSizes.add(len);
+            frameCount++;
+            moviDataSize += (8 + len + pad);
+        }
+
+        @Override
+        public void close() throws IOException {
+            long idxSize = frameCount * 16L;
+            writeFourCC("idx1");
+            writeIntLE((int) idxSize);
+            int offset = 4;
+            for (int size : frameSizes) {
+                writeFourCC("00dc");
+                writeIntLE(0x10);
+                writeIntLE(offset);
+                writeIntLE(size);
+                int pad = (size % 2 != 0) ? 1 : 0;
+                offset += (8 + size + pad);
+            }
+            bos.flush();
+            bos.close();
+
+            RandomAccessFile raf = new RandomAccessFile(file, "rw");
+            raf.seek(0);
+            long totalRiffSize = 216 + moviDataSize + 8 + idxSize;
+
+            writeRafFourCC(raf, "RIFF");
+            writeRafIntLE(raf, (int) totalRiffSize);
+            writeRafFourCC(raf, "AVI ");
+            writeRafFourCC(raf, "LIST");
+            writeRafIntLE(raf, 192);
+            writeRafFourCC(raf, "hdrl");
+            writeRafFourCC(raf, "avih");
+            writeRafIntLE(raf, 56);
+            writeRafIntLE(raf, 1000000 / fps);
+            writeRafIntLE(raf, 1000000);
+            writeRafIntLE(raf, 0);
+            writeRafIntLE(raf, 0x10);
+            writeRafIntLE(raf, frameCount);
+            writeRafIntLE(raf, 0);
+            writeRafIntLE(raf, 1);
+            writeRafIntLE(raf, 0);
+            writeRafIntLE(raf, width);
+            writeRafIntLE(raf, height);
+            for (int i = 0; i < 4; i++) writeRafIntLE(raf, 0);
+
+            writeRafFourCC(raf, "LIST");
+            writeRafIntLE(raf, 116);
+            writeRafFourCC(raf, "strl");
+            writeRafFourCC(raf, "strh");
+            writeRafIntLE(raf, 56);
+            writeRafFourCC(raf, "vids");
+            writeRafFourCC(raf, "MJPG");
+            writeRafIntLE(raf, 0);
+            writeRafIntLE(raf, 0);
+            writeRafIntLE(raf, 0);
+            writeRafIntLE(raf, 1);
+            writeRafIntLE(raf, fps);
+            writeRafIntLE(raf, 0);
+            writeRafIntLE(raf, frameCount);
+            writeRafIntLE(raf, 0);
+            writeRafIntLE(raf, -1);
+            writeRafIntLE(raf, 0);
+            writeRafShortLE(raf, (short) 0);
+            writeRafShortLE(raf, (short) 0);
+            writeRafShortLE(raf, (short) width);
+            writeRafShortLE(raf, (short) height);
+
+            writeRafFourCC(raf, "strf");
+            writeRafIntLE(raf, 40);
+            writeRafIntLE(raf, 40);
+            writeRafIntLE(raf, width);
+            writeRafIntLE(raf, height);
+            writeRafShortLE(raf, (short) 1);
+            writeRafShortLE(raf, (short) 24);
+            writeRafFourCC(raf, "MJPG");
+            writeRafIntLE(raf, width * height * 3);
+            for (int i = 0; i < 4; i++) writeRafIntLE(raf, 0);
+
+            writeRafFourCC(raf, "LIST");
+            writeRafIntLE(raf, (int) (moviDataSize + 4));
+            writeRafFourCC(raf, "movi");
+            raf.close();
+        }
+
+        private void writeFourCC(String s) throws IOException { bos.write(s.getBytes("US-ASCII")); }
+        private void writeIntLE(int v) throws IOException {
+            bos.write(v & 0xFF); bos.write((v >> 8) & 0xFF); bos.write((v >> 16) & 0xFF); bos.write((v >> 24) & 0xFF);
+        }
+        private void writeRafFourCC(RandomAccessFile raf, String s) throws IOException { raf.write(s.getBytes("US-ASCII")); }
+        private void writeRafIntLE(RandomAccessFile raf, int v) throws IOException {
+            raf.write(v & 0xFF); raf.write((v >> 8) & 0xFF); raf.write((v >> 16) & 0xFF); raf.write((v >> 24) & 0xFF);
+        }
+        private void writeRafShortLE(RandomAccessFile raf, short v) throws IOException {
+            raf.write(v & 0xFF); raf.write((v >> 8) & 0xFF);
+        }
+    }
+}
