@@ -30,7 +30,7 @@
             android:id="@+id/tvStatus"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Buka alamat di atas lewat Chrome HP/PC untuk kontrol penuh."
+            android:text="Menyiapkan kamera..."
             android:textColor="#DDDDDD"
             android:textSize="12sp" />
     </LinearLayout>
@@ -42,6 +42,13 @@
         android:layout_alignParentRight="true"
         android:layout_margin="14dp"
         android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/btnRecord"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginRight="8dp"
+            android:text="Mulai Rekam" />
 
         <Button
             android:id="@+id/btnSwitchCam"
