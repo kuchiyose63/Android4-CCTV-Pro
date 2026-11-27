@@ -8,8 +8,8 @@ android {
 
     defaultConfig {
         applicationId "com.diy.cctv4"
-        minSdk 14        // Kompatibel penuh dengan Android 4.0+
-        targetSdk 22     // Tidak memicu dialog izin runtime Android 6+
+        minSdk 14
+        targetSdk 22
         versionCode 1
         versionName "1.0"
     }
